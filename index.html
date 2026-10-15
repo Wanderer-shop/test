@@ -1696,19 +1696,19 @@ body button.bg-purple-600, body button.bg-indigo-600, body button.bg-violet-600 
         // Keep unrelated user-created catalog entries untouched.
         function removeKnownStaleCatalogRecords(state) {
             if (!state || typeof state !== 'object') return;
-            const staleCategoryIds = new Set(['cat-3']);
-            const staleAppIds = new Set(['app-1']);
+            const staleCategoryIds = new Set(['cat-3', 'cat-1', 'cat-2']);
+            const staleAppIds = new Set(['app-1', 'app-2', 'app-3', 'app-4']);
             const apps = Array.isArray(state.apps) ? state.apps : [];
             const removedAppIds = new Set(apps.filter(a => staleAppIds.has(String(a?.id || ''))).map(a => String(a.id)));
             state.categories = (Array.isArray(state.categories) ? state.categories : []).filter(c => !staleCategoryIds.has(String(c?.id || '')));
-            state.apps = apps.filter(a => !staleAppIds.has(String(a?.id || '')) && !staleCategoryIds.has(String(a?.categoryId || '')) && !/^app-import-(?:cat-3|app-1)(?:-|$)/i.test(String(a?.id || '')));
+            state.apps = apps.filter(a => !staleAppIds.has(String(a?.id || '')) && !staleCategoryIds.has(String(a?.categoryId || '')) && !/^app-import-(?:cat-3|app-1|cat-1|cat-2|app-2|app-3|app-4)(?:-|$)/i.test(String(a?.id || '')));
             for (const a of apps) if (staleCategoryIds.has(String(a?.categoryId || ''))) removedAppIds.add(String(a.id));
             // Imported IDs are internal identifiers, not selectable app names. Keep valid imported records only when they have a real parent.
             const validAppIds = new Set(state.apps.map(a => String(a?.id || '')).filter(Boolean));
             state.packages = (Array.isArray(state.packages) ? state.packages : []).filter(pkg => {
                 const appId = String(pkg?.appId || '');
                 if (removedAppIds.has(appId) || staleAppIds.has(appId)) return false;
-                if (/^pkg-import-(?:cat-3|app-1)(?:-|$)/i.test(String(pkg?.id || ''))) return false;
+                if (/^(?:pkg|import)-import-(?:cat-3|app-1|cat-1|cat-2|app-2|app-3|app-4)(?:-|$)/i.test(String(pkg?.id || '')) || /^pkg-(?:1|2|3|4)$/.test(String(pkg?.id || ''))) return false;
                 return !appId || validAppIds.has(appId);
             });
         }
@@ -3809,7 +3809,9 @@ body button.bg-purple-600, body button.bg-indigo-600, body button.bg-violet-600 
                 if (!a || a.id == null || !String(a.id).trim()) return false;
                 const id = String(a.id).trim();
                 const name = String(a.name || '').trim();
-                if (!name || /^app-import-/i.test(name) || name === id || isLegacyDemoApp(a) || a.productType === 'website-service' || a._websiteServiceId) return false;
+                const normalizedLabel = name.toLocaleLowerCase().replace(/[\s._-]+/g, '');
+                const genericPlaceholderNames = new Set(['ไอดี','id','uid','userid','accountid','รหัส','รหัสไอดี','ชื่อแอป','เลือกแอป','แอป','ไม่ระบุ','undefined','null','รายการ']);
+                if (!name || /^app-import-/i.test(id) || /^app-import-/i.test(name) || name === id || genericPlaceholderNames.has(normalizedLabel) || isLegacyDemoApp(a) || a.productType === 'website-service' || a._websiteServiceId) return false;
                 if (a.categoryId && !(appState.categories || []).some(c => String(c.id) === String(a.categoryId))) return false;
                 const normName = name.toLocaleLowerCase().replace(/\s+/g, ' ');
                 if (seenIds.has(id) || seenNames.has(normName)) return false;
@@ -5105,7 +5107,7 @@ body button.bg-purple-600, body button.bg-indigo-600, body button.bg-violet-600 
                 status:String(order.status||'PENDING'), order_data:order, updated_at:new Date().toISOString()
             };
             if(!row.order_code) throw new Error('ออเดอร์ไม่มีหมายเลข Order ID');
-            const {error}=await supabaseClient.from('orders').insert(row);
+            const {error}=await supabaseClient.from('orders').upsert(row,{onConflict:'order_code'});
             if(error) throw error;
             return true;
         }
@@ -5352,9 +5354,16 @@ body button.bg-purple-600, body button.bg-indigo-600, body button.bg-violet-600 
                 const combined = isThaiCombinedSheet(pkgs) ? mapThaiCombinedSheet(pkgs) : null;
                 if (combined) {
                     if (!combined.categories.length && !combined.apps.length && !combined.packages.length) throw new Error('ไม่พบข้อมูลสินค้าที่ใช้ได้ จึงไม่เปลี่ยนข้อมูลเดิม');
+                    const staleCategoryIds = new Set(['cat-1','cat-2','cat-3']);
+                    const staleAppIds = new Set(['app-1','app-2','app-3','app-4']);
+                    combined.categories = combined.categories.filter(c => !staleCategoryIds.has(String(c?.id || '')));
+                    combined.apps = combined.apps.filter(a => !staleAppIds.has(String(a?.id || '')) && !staleCategoryIds.has(String(a?.categoryId || '')) && !/^app-import-(?:cat-[123]|app-[1-4])(?:-|$)/i.test(String(a?.id || '')));
+                    const validAppIds = new Set([...(appState.apps || []).filter(a => !staleAppIds.has(String(a?.id || ''))), ...combined.apps].map(a => String(a?.id || '')).filter(Boolean));
+                    combined.packages = combined.packages.filter(p => !/^pkg-(?:[1-4])$/.test(String(p?.id || '')) && !/^pkg-import-(?:cat-[123]|app-[1-4])(?:-|$)/i.test(String(p?.id || '')) && (!p?.appId || validAppIds.has(String(p.appId))));
                     appState.categories = mergeById(appState.categories, combined.categories);
                     appState.apps = mergeById(appState.apps, combined.apps);
                     appState.packages = mergeById(appState.packages, combined.packages);
+                    removeKnownStaleCatalogRecords(appState);
                     changed.push(`หมวดหมู่ ${combined.categories.length}`, `แอป ${combined.apps.length}`, `แพ็กเกจย่อย ${combined.packages.length}`);
                 } else {
                     if(cats.length) { const mapped=cats.filter(r=>r.id&&r.name).map(r=>({...r,id:r.id,name:r.name,icon:r.icon||'fa-box-open',description:r.description||''})); if(mapped.length){appState.categories=mergeById(appState.categories,mapped);changed.push(`หมวดหมู่ ${mapped.length}`);} }
