@@ -1493,7 +1493,7 @@ body button.bg-purple-600, body button.bg-indigo-600, body button.bg-violet-600 
                 bankAccounts: appState.bankAccounts || {},
                 formTemplates: appState.formTemplates || {},
                 reviews: appState.reviews || [],
-                orders: appState.orders || [],
+                // Orders are stored in the private orders table, never in the public catalog payload.
                 feedbacks: appState.feedbacks || [],
                 updatedAt: new Date().toISOString()
             };
@@ -1519,7 +1519,7 @@ body button.bg-purple-600, body button.bg-indigo-600, body button.bg-violet-600 
                 if (cloud.bankAccounts) appState.bankAccounts = { ...appState.bankAccounts, ...cloud.bankAccounts };
                 if (cloud.formTemplates) appState.formTemplates = { ...appState.formTemplates, ...cloud.formTemplates };
                 if (Array.isArray(cloud.reviews)) appState.reviews = cloud.reviews;
-                if (Array.isArray(cloud.orders)) appState.orders = cloud.orders;
+                // Do not read orders from this publicly readable catalog row.
                 if (Array.isArray(cloud.feedbacks)) appState.feedbacks = cloud.feedbacks;
                 removeKnownStaleCatalogRecords(appState);
                 sharedStateLastUpdatedAt = data.updated_at || cloud.updatedAt || null;
@@ -1557,6 +1557,8 @@ body button.bg-purple-600, body button.bg-indigo-600, body button.bg-violet-600 
             sharedStatePollTimer = setInterval(async () => {
                 // Refresh only when the local editor is not actively focused on an input.
                 if (!supabaseClient || document.querySelector('#adminPanel:not(.hidden) input:focus, #adminPanel:not(.hidden) textarea:focus, #adminPanel:not(.hidden) select:focus')) return;
+                await refreshSharedVisitorCount();
+                if (supabaseAuthSession?.user && !document.querySelector('#adminPanel:not(.hidden) input:focus, #adminPanel:not(.hidden) textarea:focus, #adminPanel:not(.hidden) select:focus')) await loadAdminOrdersFromSupabase();
                 const before = sharedStateLastUpdatedAt;
                 const ok = await loadSharedStoreState();
                 if (ok && sharedStateLastUpdatedAt !== before) {
@@ -1690,7 +1692,47 @@ body button.bg-purple-600, body button.bg-indigo-600, body button.bg-violet-600 
 
         let appState = JSON.parse(localStorage.getItem('wanderer_shop_state')) || defaultState;
 
-            // Backward-compatible state normalization.
+        // Remove specifically identified stale demo records (cat-3/app-1) and their dependent packages.
+        // Keep unrelated user-created catalog entries untouched.
+        function removeKnownStaleCatalogRecords(state) {
+            if (!state || typeof state !== 'object') return;
+            const staleCategoryIds = new Set(['cat-3']);
+            const staleAppIds = new Set(['app-1']);
+            const apps = Array.isArray(state.apps) ? state.apps : [];
+            const removedAppIds = new Set(apps.filter(a => staleAppIds.has(String(a?.id || ''))).map(a => String(a.id)));
+            state.categories = (Array.isArray(state.categories) ? state.categories : []).filter(c => !staleCategoryIds.has(String(c?.id || '')));
+            state.apps = apps.filter(a => !staleAppIds.has(String(a?.id || '')) && !staleCategoryIds.has(String(a?.categoryId || '')) && !/^app-import-(?:cat-3|app-1)(?:-|$)/i.test(String(a?.id || '')));
+            for (const a of apps) if (staleCategoryIds.has(String(a?.categoryId || ''))) removedAppIds.add(String(a.id));
+            // Imported IDs are internal identifiers, not selectable app names. Keep valid imported records only when they have a real parent.
+            const validAppIds = new Set(state.apps.map(a => String(a?.id || '')).filter(Boolean));
+            state.packages = (Array.isArray(state.packages) ? state.packages : []).filter(pkg => {
+                const appId = String(pkg?.appId || '');
+                if (removedAppIds.has(appId) || staleAppIds.has(appId)) return false;
+                if (/^pkg-import-(?:cat-3|app-1)(?:-|$)/i.test(String(pkg?.id || ''))) return false;
+                return !appId || validAppIds.has(appId);
+            });
+        }
+        // Remove only known seeded demo records from older localStorage builds; preserve real/user-created records.
+        try {
+            removeKnownStaleCatalogRecords(appState);
+          const oldDemoCategoryIds=new Set(['cat-1','cat-2','cat-3']);
+          const oldDemoAppIds=new Set(['app-1','app-2','app-3','app-4']);
+          const oldDemoPkgIds=new Set(['pkg-1','pkg-2','pkg-3','pkg-4']);
+          if(Array.isArray(appState.categories)) appState.categories=appState.categories.filter(x=>!oldDemoCategoryIds.has(String(x.id)));
+          if(Array.isArray(appState.apps)) appState.apps=appState.apps.filter(x=>!oldDemoAppIds.has(String(x.id)));
+          if(Array.isArray(appState.packages)) appState.packages=appState.packages.filter(x=>!oldDemoPkgIds.has(String(x.id)));
+          if(Array.isArray(appState.reviews)) appState.reviews=appState.reviews.filter(x=>String(x.id)!=='rev-1');
+          if(Array.isArray(appState.apps)) appState.apps=appState.apps.filter(x=>!String(x?.id||'').startsWith('app-websvc-') && !x?._websiteServiceId);
+          if(Array.isArray(appState.packages)) appState.packages=appState.packages.filter(x=>!String(x?.id||'').startsWith('pkg-websvc-') && x?.productType!=='website-service');
+          if(Array.isArray(appState.categories)) appState.categories=appState.categories.filter(x=>String(x?.id||'')!=='cat-website-services-internal');
+        } catch(e) { console.warn('Demo cleanup skipped',e); }
+        // Remove only the three known legacy demo cards from saved catalog data.
+        if (Array.isArray(appState.apps)) {
+            const removedIds = new Set(appState.apps.filter(isLegacyDemoApp).map(a => a.id));
+            appState.apps = appState.apps.filter(a => !isLegacyDemoApp(a));
+            if (Array.isArray(appState.packages)) appState.packages = appState.packages.filter(p => !removedIds.has(p.appId) && !['YouTube Premium 4K','Netflix 4K Ultra HD','ROBLOX Robux'].includes(String(p.appName||p.name||'')));
+        }
+        // Backward-compatible state normalization.
         appState.settings = { ...defaultState.settings, ...(appState.settings || {}) };
         appState.websiteService = { ...defaultState.websiteService, ...(appState.websiteService || {}) };
         if (!Array.isArray(appState.websiteServices)) appState.websiteServices = [];
@@ -3305,8 +3347,8 @@ body button.bg-purple-600, body button.bg-indigo-600, body button.bg-violet-600 
         function handleAdminEditCatChange() {
             const catId = document.getElementById('adminEditTemplateCatSelect').value;
             const appSel = document.getElementById('adminEditTemplateAppSelect');
-            const apps = appState.apps.filter(a => a.categoryId === catId);
-            appSel.innerHTML = apps.map(a => `<option value="${a.id}">${a.name}</option>`).join('');
+            const apps = appState.apps.filter(a => String(a.categoryId) === String(catId) && String(a.name||'').trim() && !/^app-import-/i.test(String(a.name||'')) && String(a.name||'').trim() !== String(a.id||'').trim() && !isLegacyDemoApp(a));
+            appSel.innerHTML = apps.map(a => `<option value="${escapeHtml(String(a.id))}">${escapeHtml(String(a.name))}</option>`).join('');
         }
 
         function applyTemplateToEditArea() {
@@ -3767,7 +3809,8 @@ body button.bg-purple-600, body button.bg-indigo-600, body button.bg-violet-600 
                 if (!a || a.id == null || !String(a.id).trim()) return false;
                 const id = String(a.id).trim();
                 const name = String(a.name || '').trim();
-                if (!name || isLegacyDemoApp(a) || a.productType === 'website-service' || a._websiteServiceId) return false;
+                if (!name || /^app-import-/i.test(name) || name === id || isLegacyDemoApp(a) || a.productType === 'website-service' || a._websiteServiceId) return false;
+                if (a.categoryId && !(appState.categories || []).some(c => String(c.id) === String(a.categoryId))) return false;
                 const normName = name.toLocaleLowerCase().replace(/\s+/g, ' ');
                 if (seenIds.has(id) || seenNames.has(normName)) return false;
                 seenIds.add(id); seenNames.add(normName);
@@ -4131,8 +4174,8 @@ body button.bg-purple-600, body button.bg-indigo-600, body button.bg-violet-600 
         function handleFormTemplateCategoryChange() {
             const catId = document.getElementById('formTemplateCategorySelect').value;
             const appSel = document.getElementById('formTemplateAppSelect');
-            const apps = appState.apps.filter(a => a.categoryId === catId);
-            appSel.innerHTML = apps.map(a => `<option value="${a.id}">${a.name}</option>`).join('');
+            const apps = appState.apps.filter(a => String(a.categoryId) === String(catId) && String(a.name||'').trim() && !/^app-import-/i.test(String(a.name||'')) && String(a.name||'').trim() !== String(a.id||'').trim() && !isLegacyDemoApp(a));
+            appSel.innerHTML = apps.map(a => `<option value="${escapeHtml(String(a.id))}">${escapeHtml(String(a.name))}</option>`).join('');
             handleFormTemplateAppChange();
         }
         function handleFormTemplateAppChange() {
@@ -4800,6 +4843,8 @@ body button.bg-purple-600, body button.bg-indigo-600, body button.bg-violet-600 
                 appState.adminUser = data.user?.email || email;
                 saveState();
                 const saved = await pushSharedStoreState();
+                await loadAdminOrdersFromSupabase();
+                await refreshSharedVisitorCount();
                 closeLoginModal();
                 document.getElementById('adminRibbon').classList.remove('hidden');
                 document.getElementById('adminUsernameShow').innerText = appState.adminUser;
@@ -4984,11 +5029,32 @@ body button.bg-purple-600, body button.bg-indigo-600, body button.bg-violet-600 
             const values = { adminWorkerNotifyUrl:s.workerNotifyUrl || 'https://lineoa-001.s6741050006.workers.dev/', adminSheetBackupUrl:s.sheetBackupUrl || s.sheetAppsScriptUrl || 'https://script.google.com/macros/s/AKfycbwdOQuh2FWyfT24o4WBuC_PeZi4iu06IjlPn8JlOMtsfwOQldGA5Da7H5ObsOMPO8n5gg/exec', adminSheetAppsScriptUrl:s.sheetAppsScriptUrl || 'https://script.google.com/macros/s/AKfycbwdOQuh2FWyfT24o4WBuC_PeZi4iu06IjlPn8JlOMtsfwOQldGA5Da7H5ObsOMPO8n5gg/exec', adminSheetCategoriesUrl:s.sheetCategoriesUrl || '', adminSheetAppsUrl:s.sheetAppsUrl || '', adminSheetPackagesUrl:s.sheetPackagesUrl || '' };
             Object.entries(values).forEach(([id,v]) => { const el=document.getElementById(id); if(el) el.value=v; });
         }
-        // This counter is browser-local only; cross-device totals require a server-side visit endpoint/table.
-        function getVisitorCount(){ return Math.max(0, Number(localStorage.getItem('wanderer_shop_visits') || 0)); }
+        // Server-side shared visitor counter. The local value is only a fallback when Supabase is unavailable.
+        let sharedVisitorCount = null;
+        function getVisitorCount(){ return sharedVisitorCount == null ? Math.max(0, Number(localStorage.getItem('wanderer_shop_visits') || 0)) : Math.max(0, Number(sharedVisitorCount) || 0); }
         function renderVisitorCount(){ const el=document.getElementById('statVisits'); if(el) el.textContent=getVisitorCount().toLocaleString('th-TH'); }
-        function resetVisitorCount(){ if(!confirm('ยืนยันรีเซ็ตจำนวนผู้เข้าชมเป็น 0 เพื่อเริ่มใช้งานจริงหรือไม่?')) return; localStorage.setItem('wanderer_shop_visits','0'); renderVisitorCount(); showToast('รีเซ็ตผู้เข้าชมเป็น 0 แล้ว'); }
-        (function countVisitOncePerTab(){ try { if(!sessionStorage.getItem('wanderer_visit_counted')) { localStorage.setItem('wanderer_shop_visits', String(getVisitorCount()+1)); sessionStorage.setItem('wanderer_visit_counted','1'); } } catch(e){} })();
+        async function refreshSharedVisitorCount(){
+            if(!supabaseClient) { renderVisitorCount(); return false; }
+            try { const {data,error}=await supabaseClient.from('site_stats').select('metric_value').eq('metric_name','total_visits').maybeSingle(); if(error) throw error; if(data){sharedVisitorCount=Number(data.metric_value)||0;renderVisitorCount();return true;} }
+            catch(e){ console.warn('Shared visitor count read failed:',e.message||e); }
+            renderVisitorCount(); return false;
+        }
+        async function countSharedVisitOnce(){
+            try {
+                if(sessionStorage.getItem('wanderer_visit_counted')) return;
+                sessionStorage.setItem('wanderer_visit_counted','1');
+                if(supabaseClient){ const {data,error}=await supabaseClient.rpc('increment_site_visit'); if(error) throw error; if(typeof data==='number') sharedVisitorCount=data; else await refreshSharedVisitorCount(); }
+                else localStorage.setItem('wanderer_shop_visits',String(getVisitorCount()+1));
+            } catch(e){ console.warn('Shared visit count failed; using local fallback:',e.message||e); try{localStorage.setItem('wanderer_shop_visits',String(getVisitorCount()+1));}catch(_){} }
+            renderVisitorCount();
+        }
+        async function resetVisitorCount(){
+            if(!confirm('รีเซ็ตจำนวนผู้เข้าชมเป็น 0 หรือไม่?')) return;
+            if(!supabaseClient || !supabaseAuthSession?.user){showToast('ต้องเข้าสู่ระบบแอดมิน Supabase ก่อนรีเซ็ตยอดส่วนกลาง');return;}
+            try { const {error}=await supabaseClient.from('site_stats').update({metric_value:0,updated_at:new Date().toISOString()}).eq('metric_name','total_visits'); if(error) throw error; sharedVisitorCount=0; renderVisitorCount(); showToast('รีเซ็ตยอดผู้เข้าชมส่วนกลางแล้ว'); }
+            catch(e){showToast('รีเซ็ตไม่สำเร็จ: '+(e.message||e));}
+        }
+        (function countVisitOncePerTab(){ if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',()=>countSharedVisitOnce(),{once:true}); else countSharedVisitOnce(); })();
 
         // Website-wide appearance editor
         const websiteThemeDefaults={pageBg:'#f8f7ff',textColor:'#334155',headingColor:'#6d28d9',buttonColor:'#7c3aed',cardBg:'#ffffff',cardBorder:'#e9d5ff',fontFamily:'system'};
@@ -5030,14 +5096,44 @@ body button.bg-purple-600, body button.bg-indigo-600, body button.bg-violet-600 
         async function notifyOrderToWorker(order) {
             return onCustomerCreateOrder({ id: order.id, customerName: order.customerName || order.name || 'ลูกค้าเว็บไซต์', items: order.items || [], total: order.total, itemNames: (order.items || []).map(i => `${i.name} x${getCartQuantity(i)}`).join(', ') });
         }
+        async function mirrorOrderToSupabase(order) {
+            if(!supabaseClient) throw new Error('Supabase client ยังไม่พร้อม');
+            const row={
+                order_code:String(order.id||''), customer_name:String(order.customerName||order.name||''),
+                contact:String(order.contact||order.customerContact||''), items:Array.isArray(order.items)?order.items:[],
+                total_price:Number(order.totalPrice??order.total)||0, slip_url:(typeof order.slipImg==='string'&&/^https?:\/\//i.test(order.slipImg))?order.slipImg:null,
+                status:String(order.status||'PENDING'), order_data:order, updated_at:new Date().toISOString()
+            };
+            if(!row.order_code) throw new Error('ออเดอร์ไม่มีหมายเลข Order ID');
+            const {error}=await supabaseClient.from('orders').insert(row);
+            if(error) throw error;
+            return true;
+        }
         async function backupOrderToSheet(order) {
             const endpoint = String(appState.settings?.sheetBackupUrl || appState.settings?.sheetAppsScriptUrl || '').trim();
-            if (!endpoint) return { skipped:true, reason:'Google Sheets backup endpoint not configured' };
+            if (!endpoint) throw new Error('ยังไม่ได้ตั้งค่า Google Apps Script URL สำหรับบันทึกออเดอร์');
             const response = await fetch(endpoint, { method:'POST', headers:{'Content-Type':'text/plain;charset=utf-8'}, body:JSON.stringify({ type:'order_backup', action:'save_order', order }) , mode:'cors' });
             if (!response.ok) throw new Error(`Sheets backup HTTP ${response.status}`);
             const result = await response.json();
             if (result && result.success === false) throw new Error(result.error || 'Google Sheets ปฏิเสธการบันทึกออเดอร์');
+            // Sheets remains primary; mirror the same order to Supabase for the admin dashboard.
+            try { await mirrorOrderToSupabase(order); result.supabaseSaved=true; }
+            catch(e) { result.supabaseSaved=false; result.supabaseError=String(e?.message||e); console.error('Supabase order mirror failed:',e); }
             return result;
+        }
+        async function loadAdminOrdersFromSupabase() {
+            if(!supabaseClient || !supabaseAuthSession?.user) return false;
+            try {
+                const {data,error}=await supabaseClient.from('orders').select('order_code,order_data,created_at,updated_at').order('created_at',{ascending:false}).limit(500);
+                if(error) throw error;
+                const cloudOrders=(data||[]).map(r=>r.order_data&&typeof r.order_data==='object'?r.order_data:{id:r.order_code,date:r.created_at,items:r.items||[],total:r.total_price||0,status:r.status||'PENDING'});
+                const byId=new Map((Array.isArray(appState.orders)?appState.orders:[]).map(o=>[String(o.id),o]));
+                for(const o of cloudOrders){const id=String(o.id||'');if(id)byId.set(id,{...(byId.get(id)||{}),...o});}
+                appState.orders=Array.from(byId.values()).sort((a,b)=>new Date(b.createdAt||b.date||0)-new Date(a.createdAt||a.date||0));
+                saveState();
+                try{renderAdminOrdersTable();}catch(_){}
+                return true;
+            } catch(e){console.warn('Admin order load from Supabase failed:',e.message||e);return false;}
         }
         async function testWorkerNotification() {
             saveIntegrationSettings();
@@ -5283,6 +5379,7 @@ body button.bg-purple-600, body button.bg-indigo-600, body button.bg-violet-600 
             if (supabaseClient) {
                 try { const { data } = await supabaseClient.auth.getSession(); supabaseAuthSession = data?.session || null; } catch (e) { console.warn('Supabase session restore failed', e); }
                 await loadSharedStoreState();
+                await refreshSharedVisitorCount();
                 startSharedStateAutoRefresh();
             }
             normalizeCart();
