@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>WANDERER SHOP - ร้านค้าสินค้าดิจิทัล</title>
+    <!-- Patched v61: privacy-safe shared state and non-destructive browser-cache recovery -->
     <!-- Tailwind CSS CDN -->
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
@@ -1493,8 +1494,9 @@ body button.bg-purple-600, body button.bg-indigo-600, body button.bg-violet-600 
                 bankAccounts: appState.bankAccounts || {},
                 formTemplates: appState.formTemplates || {},
                 reviews: appState.reviews || [],
-                // Orders are stored in the private orders table, never in the public catalog payload.
-                feedbacks: appState.feedbacks || [],
+                orders: appState.orders || [],
+                // Orders, payment slips, customer-submitted fields, delivery credentials, and feedback
+                // must live in separately protected tables; never put them in the public shared-state row.
                 updatedAt: new Date().toISOString()
             };
         }
@@ -1519,8 +1521,10 @@ body button.bg-purple-600, body button.bg-indigo-600, body button.bg-violet-600 
                 if (cloud.bankAccounts) appState.bankAccounts = { ...appState.bankAccounts, ...cloud.bankAccounts };
                 if (cloud.formTemplates) appState.formTemplates = { ...appState.formTemplates, ...cloud.formTemplates };
                 if (Array.isArray(cloud.reviews)) appState.reviews = cloud.reviews;
-                // Do not read orders from this publicly readable catalog row.
-                if (Array.isArray(cloud.feedbacks)) appState.feedbacks = cloud.feedbacks;
+                if (Array.isArray(cloud.orders)) appState.orders = cloud.orders;
+                // Do not hydrate orders or customer feedback from a public catalog payload.
+                // Load them only from protected tables after order-level authorization is implemented.
+
                 removeKnownStaleCatalogRecords(appState);
                 sharedStateLastUpdatedAt = data.updated_at || cloud.updatedAt || null;
                 localStorage.setItem('wanderer_shop_state', JSON.stringify(appState));
@@ -1557,8 +1561,6 @@ body button.bg-purple-600, body button.bg-indigo-600, body button.bg-violet-600 
             sharedStatePollTimer = setInterval(async () => {
                 // Refresh only when the local editor is not actively focused on an input.
                 if (!supabaseClient || document.querySelector('#adminPanel:not(.hidden) input:focus, #adminPanel:not(.hidden) textarea:focus, #adminPanel:not(.hidden) select:focus')) return;
-                await refreshSharedVisitorCount();
-                if (supabaseAuthSession?.user && !document.querySelector('#adminPanel:not(.hidden) input:focus, #adminPanel:not(.hidden) textarea:focus, #adminPanel:not(.hidden) select:focus')) await loadAdminOrdersFromSupabase();
                 const before = sharedStateLastUpdatedAt;
                 const ok = await loadSharedStoreState();
                 if (ok && sharedStateLastUpdatedAt !== before) {
@@ -1696,21 +1698,14 @@ body button.bg-purple-600, body button.bg-indigo-600, body button.bg-violet-600 
         // Keep unrelated user-created catalog entries untouched.
         function removeKnownStaleCatalogRecords(state) {
             if (!state || typeof state !== 'object') return;
-            const staleCategoryIds = new Set(['cat-3', 'cat-1', 'cat-2']);
-            const staleAppIds = new Set(['app-1', 'app-2', 'app-3', 'app-4']);
+            const staleCategoryIds = new Set(['cat-3']);
+            const staleAppIds = new Set(['app-1']);
             const apps = Array.isArray(state.apps) ? state.apps : [];
             const removedAppIds = new Set(apps.filter(a => staleAppIds.has(String(a?.id || ''))).map(a => String(a.id)));
             state.categories = (Array.isArray(state.categories) ? state.categories : []).filter(c => !staleCategoryIds.has(String(c?.id || '')));
-            state.apps = apps.filter(a => !staleAppIds.has(String(a?.id || '')) && !staleCategoryIds.has(String(a?.categoryId || '')) && !/^app-import-(?:cat-3|app-1|cat-1|cat-2|app-2|app-3|app-4)(?:-|$)/i.test(String(a?.id || '')));
+            state.apps = apps.filter(a => !staleAppIds.has(String(a?.id || '')) && !staleCategoryIds.has(String(a?.categoryId || '')));
             for (const a of apps) if (staleCategoryIds.has(String(a?.categoryId || ''))) removedAppIds.add(String(a.id));
-            // Imported IDs are internal identifiers, not selectable app names. Keep valid imported records only when they have a real parent.
-            const validAppIds = new Set(state.apps.map(a => String(a?.id || '')).filter(Boolean));
-            state.packages = (Array.isArray(state.packages) ? state.packages : []).filter(pkg => {
-                const appId = String(pkg?.appId || '');
-                if (removedAppIds.has(appId) || staleAppIds.has(appId)) return false;
-                if (/^(?:pkg|import)-import-(?:cat-3|app-1|cat-1|cat-2|app-2|app-3|app-4)(?:-|$)/i.test(String(pkg?.id || '')) || /^pkg-(?:1|2|3|4)$/.test(String(pkg?.id || ''))) return false;
-                return !appId || validAppIds.has(appId);
-            });
+            state.packages = (Array.isArray(state.packages) ? state.packages : []).filter(pkg => !removedAppIds.has(String(pkg?.appId || '')) && !staleAppIds.has(String(pkg?.appId || '')));
         }
         // Remove only known seeded demo records from older localStorage builds; preserve real/user-created records.
         try {
@@ -1877,8 +1872,9 @@ body button.bg-purple-600, body button.bg-indigo-600, body button.bg-violet-600 
                 console.warn('Browser cache save failed; cloud sync will still be attempted:', e);
                 try {
                     ['wanderer_shop_state_backup','wanderer_shop_last_snapshot','wanderer_shop_cache'].forEach(k => { try { localStorage.removeItem(k); } catch (_) {} });
-                    const compact = JSON.stringify({settings:{},categories:[],apps:[],packages:[],orders:[],websiteServices:[],websiteService:{},bankAccounts:{},formTemplates:{},reviews:[],feedbacks:[]});
-                    localStorage.setItem('wanderer_shop_state', compact);
+                    // Do not replace the existing cache with an empty state: that could hide unsynced edits.
+                    // Keep the last saved value intact and continue attempting remote persistence below.
+                    console.warn('Browser storage quota exceeded; preserved the last saved cache instead of clearing catalog data.');
                 } catch (_) {
                     if (!storageWarningShown) {
                         storageWarningShown = true;
@@ -2419,25 +2415,28 @@ body button.bg-purple-600, body button.bg-indigo-600, body button.bg-violet-600 
             appState.orders.unshift(lineOrder);
             saveState();
             notifyOrderToWorker(lineOrder).catch(err => console.warn('Worker notification failed:', err));
-            let lineSheetSaved = false;
-            try { const sheetResult = await backupOrderToSheet(lineOrder); lineSheetSaved = sheetResult?.success === true; }
-            catch (err) { console.error('Google Sheets order save failed:', err); showToast('บันทึกออเดอร์ LINE ลง Google Sheets ไม่สำเร็จ'); }
+            backupOrderToSheet(lineOrder).catch(err => console.warn('Google Sheets backup failed:', err));
 
-            const itemsText = itemsSnapshot.map((item, i) => {
-                const appName = item.appName || item.app || item.categoryName || item.category || item.name || 'สินค้า';
-                const packageName = item.packageName || item.package || item.variantName || item.name || 'แพ็กเกจ';
-                const groupName = item.groupName || item.packageGroup || item.packageCategory || item.group || '';
+  const itemsText = itemsSnapshot.map((item, i) => {
+                // ดึงชื่อแอปที่ถูกต้องจาก appState.apps
+                const app = appState.apps.find(a => a.id === item.appId);
+                const appName = app ? app.name : (item.appName || item.app || 'สินค้า');
+                const packageName = item.name || 'แพ็กเกจ';
+                const groupName = item.groupName || item.packageGroup || '';
                 const qty = getCartQuantity(item);
                 const unitPrice = Number(item.price) || 0;
-                const groupLine = groupName && !['ไม่ระบุกลุ่ม', 'ไม่ระบุ', '-'].includes(String(groupName).trim())
+                
+                const groupLine = groupName && !['ไม่ระบุกลุ่ม', 'ไม่ระบุ', '-', 'ทั่วไป'].includes(String(groupName).trim())
                     ? `\n   กลุ่มแพ็กเกจ : ${groupName}` : '';
                 const qtyLine = qty > 1 ? `\n   จำนวน : ${qty}` : '';
+                
                 return `${i+1}. ชื่อแอพ : ${appName}\n   แพ็กเกจย่อย : ${packageName}${groupLine}${qtyLine}\n   ราคา: ${unitPrice.toLocaleString('th-TH')}`;
-            }).join('\n\n');
+            }).join('\n---------------------------\n'); // ปรับให้มีขีดคั่นระหว่างรายการถ้ามีหลายรายการ
+
             const tmpl = `🛒 รายการสั่งซื้อ (Wanderer_Shop)\n\nเลขออเดอร์ : ${orderId}\n---------------------------\n${itemsText}\n---------------------------\n💰 ยอดรวมทั้งสิ้น: ${total.toLocaleString('th-TH')}\n---------------------------\nรบกวนรอแม่ค้าตอบก่อนค่อยโอนนะคะ`;
             const copied = await copyToClipboard(tmpl);
             if (copied) {
-                alert('คัดลอกข้อความแจ้งสั่งซื้อ LINE เรียบร้อยแล้วค่ะ\n\n' + (lineSheetSaved ? 'บันทึกออเดอร์ลง Google Sheets แล้ว\n' : 'คำเตือน: ยังยืนยันการบันทึกลง Google Sheets ไม่ได้\n') + '\nเปิดห้องแชท LINE แล้ววางข้อความเพื่อส่งให้ร้านค้าได้เลย');
+                alert('คัดลอกข้อความแจ้งสั่งซื้อ LINE เรียบร้อยแล้วค่ะ\n\nเปิดห้องแชท LINE แล้ววางข้อความเพื่อส่งให้ร้านค้าได้เลย');
                 const rawId = String(appState.settings.lineId || '@997pfoig').trim();
                 const linePathId = rawId.startsWith('@') ? rawId : '@' + rawId;
                 window.open(`https://line.me/R/ti/p/${encodeURIComponent(linePathId)}`, '_blank', 'noopener');
@@ -2832,7 +2831,7 @@ body button.bg-purple-600, body button.bg-indigo-600, body button.bg-violet-600 
             const total = getCartTotal();
 
             const reader = new FileReader();
-            reader.onload = async function(e) {
+            reader.onload = function(e) {
                 const newOrder = {
                     id: orderId,
                     date: new Date().toLocaleString('th-TH'),
@@ -2848,9 +2847,7 @@ body button.bg-purple-600, body button.bg-indigo-600, body button.bg-violet-600 
                 appState.orders.unshift(newOrder);
                 notifyOrderToWorker(newOrder).catch(err => console.warn('Worker notification failed:', err));
                 onCustomerUploadSlip(orderId, total, newOrder.slipImg).catch(err => console.warn('Slip notification failed:', err));
-                let sheetSaved = false;
-                try { const sheetResult = await backupOrderToSheet(newOrder); sheetSaved = sheetResult?.success === true; }
-                catch (err) { console.error('Google Sheets order save failed:', err); showToast('บันทึกออเดอร์ลง Google Sheets ไม่สำเร็จ กรุณาแจ้งร้านก่อนโอน'); }
+                backupOrderToSheet(newOrder).catch(err => console.warn('Google Sheets backup failed:', err));
                 appState.cart = [];
                 appState.pendingCustomerRequirements = {};
                 saveState();
@@ -2859,7 +2856,7 @@ body button.bg-purple-600, body button.bg-indigo-600, body button.bg-violet-600 
                 navigateTo('order-tracking');
                 document.getElementById('trackOrderIdInput').value = orderId;
                 searchOrderManual();
-                showToast(sheetSaved ? `สร้างออเดอร์ ${orderId} และบันทึกลง Google Sheets แล้ว` : `สร้างออเดอร์ ${orderId} ในหน้านี้แล้ว แต่ต้องตรวจสอบการบันทึก Google Sheets`);
+                showToast(`สร้างออเดอร์ ${orderId} สำเร็จ`);
             };
             reader.readAsDataURL(fileInput.files[0]);
         }
@@ -3347,8 +3344,8 @@ body button.bg-purple-600, body button.bg-indigo-600, body button.bg-violet-600 
         function handleAdminEditCatChange() {
             const catId = document.getElementById('adminEditTemplateCatSelect').value;
             const appSel = document.getElementById('adminEditTemplateAppSelect');
-            const apps = appState.apps.filter(a => String(a.categoryId) === String(catId) && String(a.name||'').trim() && !/^app-import-/i.test(String(a.name||'')) && String(a.name||'').trim() !== String(a.id||'').trim() && !isLegacyDemoApp(a));
-            appSel.innerHTML = apps.map(a => `<option value="${escapeHtml(String(a.id))}">${escapeHtml(String(a.name))}</option>`).join('');
+            const apps = appState.apps.filter(a => a.categoryId === catId);
+            appSel.innerHTML = apps.map(a => `<option value="${a.id}">${a.name}</option>`).join('');
         }
 
         function applyTemplateToEditArea() {
@@ -3511,7 +3508,8 @@ body button.bg-purple-600, body button.bg-indigo-600, body button.bg-violet-600 
                 updatedAt: new Date().toISOString(),
                 categories: appState.categories || [],
                 apps: appState.apps || [],
-                packages: appState.packages || []
+                packages: appState.packages || [],
+                syncToken: "Wanderer-1706-"
             };
             try {
                 let response;
@@ -3809,10 +3807,7 @@ body button.bg-purple-600, body button.bg-indigo-600, body button.bg-violet-600 
                 if (!a || a.id == null || !String(a.id).trim()) return false;
                 const id = String(a.id).trim();
                 const name = String(a.name || '').trim();
-                const normalizedLabel = name.toLocaleLowerCase().replace(/[\s._-]+/g, '');
-                const genericPlaceholderNames = new Set(['ไอดี','id','uid','userid','accountid','รหัส','รหัสไอดี','ชื่อแอป','เลือกแอป','แอป','ไม่ระบุ','undefined','null','รายการ']);
-                if (!name || /^app-import-/i.test(id) || /^app-import-/i.test(name) || name === id || genericPlaceholderNames.has(normalizedLabel) || isLegacyDemoApp(a) || a.productType === 'website-service' || a._websiteServiceId) return false;
-                if (a.categoryId && !(appState.categories || []).some(c => String(c.id) === String(a.categoryId))) return false;
+                if (!name || isLegacyDemoApp(a) || a.productType === 'website-service' || a._websiteServiceId) return false;
                 const normName = name.toLocaleLowerCase().replace(/\s+/g, ' ');
                 if (seenIds.has(id) || seenNames.has(normName)) return false;
                 seenIds.add(id); seenNames.add(normName);
@@ -4176,8 +4171,8 @@ body button.bg-purple-600, body button.bg-indigo-600, body button.bg-violet-600 
         function handleFormTemplateCategoryChange() {
             const catId = document.getElementById('formTemplateCategorySelect').value;
             const appSel = document.getElementById('formTemplateAppSelect');
-            const apps = appState.apps.filter(a => String(a.categoryId) === String(catId) && String(a.name||'').trim() && !/^app-import-/i.test(String(a.name||'')) && String(a.name||'').trim() !== String(a.id||'').trim() && !isLegacyDemoApp(a));
-            appSel.innerHTML = apps.map(a => `<option value="${escapeHtml(String(a.id))}">${escapeHtml(String(a.name))}</option>`).join('');
+            const apps = appState.apps.filter(a => a.categoryId === catId);
+            appSel.innerHTML = apps.map(a => `<option value="${a.id}">${a.name}</option>`).join('');
             handleFormTemplateAppChange();
         }
         function handleFormTemplateAppChange() {
@@ -4845,8 +4840,6 @@ body button.bg-purple-600, body button.bg-indigo-600, body button.bg-violet-600 
                 appState.adminUser = data.user?.email || email;
                 saveState();
                 const saved = await pushSharedStoreState();
-                await loadAdminOrdersFromSupabase();
-                await refreshSharedVisitorCount();
                 closeLoginModal();
                 document.getElementById('adminRibbon').classList.remove('hidden');
                 document.getElementById('adminUsernameShow').innerText = appState.adminUser;
@@ -5031,32 +5024,11 @@ body button.bg-purple-600, body button.bg-indigo-600, body button.bg-violet-600 
             const values = { adminWorkerNotifyUrl:s.workerNotifyUrl || 'https://lineoa-001.s6741050006.workers.dev/', adminSheetBackupUrl:s.sheetBackupUrl || s.sheetAppsScriptUrl || 'https://script.google.com/macros/s/AKfycbwdOQuh2FWyfT24o4WBuC_PeZi4iu06IjlPn8JlOMtsfwOQldGA5Da7H5ObsOMPO8n5gg/exec', adminSheetAppsScriptUrl:s.sheetAppsScriptUrl || 'https://script.google.com/macros/s/AKfycbwdOQuh2FWyfT24o4WBuC_PeZi4iu06IjlPn8JlOMtsfwOQldGA5Da7H5ObsOMPO8n5gg/exec', adminSheetCategoriesUrl:s.sheetCategoriesUrl || '', adminSheetAppsUrl:s.sheetAppsUrl || '', adminSheetPackagesUrl:s.sheetPackagesUrl || '' };
             Object.entries(values).forEach(([id,v]) => { const el=document.getElementById(id); if(el) el.value=v; });
         }
-        // Server-side shared visitor counter. The local value is only a fallback when Supabase is unavailable.
-        let sharedVisitorCount = null;
-        function getVisitorCount(){ return sharedVisitorCount == null ? Math.max(0, Number(localStorage.getItem('wanderer_shop_visits') || 0)) : Math.max(0, Number(sharedVisitorCount) || 0); }
-        function renderVisitorCount(){ const el=document.getElementById('statVisits'); if(el) el.textContent=getVisitorCount().toLocaleString('th-TH'); }
-        async function refreshSharedVisitorCount(){
-            if(!supabaseClient) { renderVisitorCount(); return false; }
-            try { const {data,error}=await supabaseClient.from('site_stats').select('metric_value').eq('metric_name','total_visits').maybeSingle(); if(error) throw error; if(data){sharedVisitorCount=Number(data.metric_value)||0;renderVisitorCount();return true;} }
-            catch(e){ console.warn('Shared visitor count read failed:',e.message||e); }
-            renderVisitorCount(); return false;
-        }
-        async function countSharedVisitOnce(){
-            try {
-                if(sessionStorage.getItem('wanderer_visit_counted')) return;
-                sessionStorage.setItem('wanderer_visit_counted','1');
-                if(supabaseClient){ const {data,error}=await supabaseClient.rpc('increment_site_visit'); if(error) throw error; if(typeof data==='number') sharedVisitorCount=data; else await refreshSharedVisitorCount(); }
-                else localStorage.setItem('wanderer_shop_visits',String(getVisitorCount()+1));
-            } catch(e){ console.warn('Shared visit count failed; using local fallback:',e.message||e); try{localStorage.setItem('wanderer_shop_visits',String(getVisitorCount()+1));}catch(_){} }
-            renderVisitorCount();
-        }
-        async function resetVisitorCount(){
-            if(!confirm('รีเซ็ตจำนวนผู้เข้าชมเป็น 0 หรือไม่?')) return;
-            if(!supabaseClient || !supabaseAuthSession?.user){showToast('ต้องเข้าสู่ระบบแอดมิน Supabase ก่อนรีเซ็ตยอดส่วนกลาง');return;}
-            try { const {error}=await supabaseClient.from('site_stats').update({metric_value:0,updated_at:new Date().toISOString()}).eq('metric_name','total_visits'); if(error) throw error; sharedVisitorCount=0; renderVisitorCount(); showToast('รีเซ็ตยอดผู้เข้าชมส่วนกลางแล้ว'); }
-            catch(e){showToast('รีเซ็ตไม่สำเร็จ: '+(e.message||e));}
-        }
-        (function countVisitOncePerTab(){ if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',()=>countSharedVisitOnce(),{once:true}); else countSharedVisitOnce(); })();
+        // This counter is browser-local only; cross-device totals require a server-side visit endpoint/table.
+        function getVisitorCount(){ return Math.max(0, Number(localStorage.getItem('wanderer_shop_visits') || 0)); }
+        function renderVisitorCount(){ const el=document.getElementById('statVisits'); if(el) { el.textContent=getVisitorCount().toLocaleString('th-TH'); el.title='ตัวเลขนี้นับเฉพาะเบราว์เซอร์เครื่องนี้ ยังไม่ใช่ยอดรวมทุกอุปกรณ์'; } }
+        function resetVisitorCount(){ if(!confirm('ยืนยันรีเซ็ตจำนวนผู้เข้าชมเป็น 0 เพื่อเริ่มใช้งานจริงหรือไม่?')) return; localStorage.setItem('wanderer_shop_visits','0'); renderVisitorCount(); showToast('รีเซ็ตผู้เข้าชมเป็น 0 แล้ว'); }
+        (function countVisitOncePerTab(){ try { if(!sessionStorage.getItem('wanderer_visit_counted')) { localStorage.setItem('wanderer_shop_visits', String(getVisitorCount()+1)); sessionStorage.setItem('wanderer_visit_counted','1'); } } catch(e){} })();
 
         // Website-wide appearance editor
         const websiteThemeDefaults={pageBg:'#f8f7ff',textColor:'#334155',headingColor:'#6d28d9',buttonColor:'#7c3aed',cardBg:'#ffffff',cardBorder:'#e9d5ff',fontFamily:'system'};
@@ -5098,44 +5070,14 @@ body button.bg-purple-600, body button.bg-indigo-600, body button.bg-violet-600 
         async function notifyOrderToWorker(order) {
             return onCustomerCreateOrder({ id: order.id, customerName: order.customerName || order.name || 'ลูกค้าเว็บไซต์', items: order.items || [], total: order.total, itemNames: (order.items || []).map(i => `${i.name} x${getCartQuantity(i)}`).join(', ') });
         }
-        async function mirrorOrderToSupabase(order) {
-            if(!supabaseClient) throw new Error('Supabase client ยังไม่พร้อม');
-            const row={
-                order_code:String(order.id||''), customer_name:String(order.customerName||order.name||''),
-                contact:String(order.contact||order.customerContact||''), items:Array.isArray(order.items)?order.items:[],
-                total_price:Number(order.totalPrice??order.total)||0, slip_url:(typeof order.slipImg==='string'&&/^https?:\/\//i.test(order.slipImg))?order.slipImg:null,
-                status:String(order.status||'PENDING'), order_data:order, updated_at:new Date().toISOString()
-            };
-            if(!row.order_code) throw new Error('ออเดอร์ไม่มีหมายเลข Order ID');
-            const {error}=await supabaseClient.from('orders').upsert(row,{onConflict:'order_code'});
-            if(error) throw error;
-            return true;
-        }
         async function backupOrderToSheet(order) {
             const endpoint = String(appState.settings?.sheetBackupUrl || appState.settings?.sheetAppsScriptUrl || '').trim();
-            if (!endpoint) throw new Error('ยังไม่ได้ตั้งค่า Google Apps Script URL สำหรับบันทึกออเดอร์');
+            if (!endpoint) return { skipped:true, reason:'Google Sheets backup endpoint not configured' };
             const response = await fetch(endpoint, { method:'POST', headers:{'Content-Type':'text/plain;charset=utf-8'}, body:JSON.stringify({ type:'order_backup', action:'save_order', order }) , mode:'cors' });
             if (!response.ok) throw new Error(`Sheets backup HTTP ${response.status}`);
             const result = await response.json();
             if (result && result.success === false) throw new Error(result.error || 'Google Sheets ปฏิเสธการบันทึกออเดอร์');
-            // Sheets remains primary; mirror the same order to Supabase for the admin dashboard.
-            try { await mirrorOrderToSupabase(order); result.supabaseSaved=true; }
-            catch(e) { result.supabaseSaved=false; result.supabaseError=String(e?.message||e); console.error('Supabase order mirror failed:',e); }
             return result;
-        }
-        async function loadAdminOrdersFromSupabase() {
-            if(!supabaseClient || !supabaseAuthSession?.user) return false;
-            try {
-                const {data,error}=await supabaseClient.from('orders').select('order_code,order_data,created_at,updated_at').order('created_at',{ascending:false}).limit(500);
-                if(error) throw error;
-                const cloudOrders=(data||[]).map(r=>r.order_data&&typeof r.order_data==='object'?r.order_data:{id:r.order_code,date:r.created_at,items:r.items||[],total:r.total_price||0,status:r.status||'PENDING'});
-                const byId=new Map((Array.isArray(appState.orders)?appState.orders:[]).map(o=>[String(o.id),o]));
-                for(const o of cloudOrders){const id=String(o.id||'');if(id)byId.set(id,{...(byId.get(id)||{}),...o});}
-                appState.orders=Array.from(byId.values()).sort((a,b)=>new Date(b.createdAt||b.date||0)-new Date(a.createdAt||a.date||0));
-                saveState();
-                try{renderAdminOrdersTable();}catch(_){}
-                return true;
-            } catch(e){console.warn('Admin order load from Supabase failed:',e.message||e);return false;}
         }
         async function testWorkerNotification() {
             saveIntegrationSettings();
@@ -5354,16 +5296,9 @@ body button.bg-purple-600, body button.bg-indigo-600, body button.bg-violet-600 
                 const combined = isThaiCombinedSheet(pkgs) ? mapThaiCombinedSheet(pkgs) : null;
                 if (combined) {
                     if (!combined.categories.length && !combined.apps.length && !combined.packages.length) throw new Error('ไม่พบข้อมูลสินค้าที่ใช้ได้ จึงไม่เปลี่ยนข้อมูลเดิม');
-                    const staleCategoryIds = new Set(['cat-1','cat-2','cat-3']);
-                    const staleAppIds = new Set(['app-1','app-2','app-3','app-4']);
-                    combined.categories = combined.categories.filter(c => !staleCategoryIds.has(String(c?.id || '')));
-                    combined.apps = combined.apps.filter(a => !staleAppIds.has(String(a?.id || '')) && !staleCategoryIds.has(String(a?.categoryId || '')) && !/^app-import-(?:cat-[123]|app-[1-4])(?:-|$)/i.test(String(a?.id || '')));
-                    const validAppIds = new Set([...(appState.apps || []).filter(a => !staleAppIds.has(String(a?.id || ''))), ...combined.apps].map(a => String(a?.id || '')).filter(Boolean));
-                    combined.packages = combined.packages.filter(p => !/^pkg-(?:[1-4])$/.test(String(p?.id || '')) && !/^pkg-import-(?:cat-[123]|app-[1-4])(?:-|$)/i.test(String(p?.id || '')) && (!p?.appId || validAppIds.has(String(p.appId))));
                     appState.categories = mergeById(appState.categories, combined.categories);
                     appState.apps = mergeById(appState.apps, combined.apps);
                     appState.packages = mergeById(appState.packages, combined.packages);
-                    removeKnownStaleCatalogRecords(appState);
                     changed.push(`หมวดหมู่ ${combined.categories.length}`, `แอป ${combined.apps.length}`, `แพ็กเกจย่อย ${combined.packages.length}`);
                 } else {
                     if(cats.length) { const mapped=cats.filter(r=>r.id&&r.name).map(r=>({...r,id:r.id,name:r.name,icon:r.icon||'fa-box-open',description:r.description||''})); if(mapped.length){appState.categories=mergeById(appState.categories,mapped);changed.push(`หมวดหมู่ ${mapped.length}`);} }
@@ -5388,7 +5323,6 @@ body button.bg-purple-600, body button.bg-indigo-600, body button.bg-violet-600 
             if (supabaseClient) {
                 try { const { data } = await supabaseClient.auth.getSession(); supabaseAuthSession = data?.session || null; } catch (e) { console.warn('Supabase session restore failed', e); }
                 await loadSharedStoreState();
-                await refreshSharedVisitorCount();
                 startSharedStateAutoRefresh();
             }
             normalizeCart();
